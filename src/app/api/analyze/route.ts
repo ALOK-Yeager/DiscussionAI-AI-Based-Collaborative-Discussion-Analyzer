@@ -46,55 +46,60 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Initialize the AI SDK
-    const zai = await ZAI.create()
-
-    // Call the LLM to analyze the discussion
-    const completion = await zai.chat.completions.create({
-      messages: [
-        {
-          role: 'assistant',
-          content: SYSTEM_PROMPT,
-        },
-        {
-          role: 'user',
-          content: `Analyze the following team discussion and extract the summary, decisions, and action items:\n\n${discussion}`,
-        },
-      ],
-      thinking: { type: 'disabled' },
-    })
-
-    const responseContent = completion.choices[0]?.message?.content
-
-    if (!responseContent) {
-      throw new Error('No response from AI')
+    let analysisResult: {
+      summary: string
+      decisions: string[]
+      action_items: Array<{ task: string; assignee: string; deadline?: string }>
     }
 
-    // Parse the JSON response
-    let analysisResult
     try {
-      // Clean the response - remove any markdown code blocks if present
-      let cleanedResponse = responseContent.trim()
-      if (cleanedResponse.startsWith('```json')) {
-        cleanedResponse = cleanedResponse.slice(7)
-      } else if (cleanedResponse.startsWith('```')) {
-        cleanedResponse = cleanedResponse.slice(3)
+      // Initialize the AI SDK
+      const zai = await ZAI.create()
+
+      // Call the LLM to analyze the discussion
+      const completion = await zai.chat.completions.create({
+        messages: [
+          {
+            role: 'system',
+            content: SYSTEM_PROMPT,
+          },
+          {
+            role: 'user',
+            content: `Analyze the following team discussion and extract the summary, decisions, and action items:\n\n${discussion}`,
+          },
+        ],
+        thinking: { type: 'disabled' },
+      })
+
+      const responseContent = completion.choices[0]?.message?.content
+
+      if (!responseContent) {
+        throw new Error('No response from AI')
       }
-      if (cleanedResponse.endsWith('```')) {
-        cleanedResponse = cleanedResponse.slice(0, -3)
+
+      // Parse the JSON response
+      try {
+        // Clean the response - remove any markdown code blocks if present
+        let cleanedResponse = responseContent.trim()
+        if (cleanedResponse.startsWith('```json')) {
+          cleanedResponse = cleanedResponse.slice(7)
+        } else if (cleanedResponse.startsWith('```')) {
+          cleanedResponse = cleanedResponse.slice(3)
+        }
+        if (cleanedResponse.endsWith('```')) {
+          cleanedResponse = cleanedResponse.slice(0, -3)
+        }
+        cleanedResponse = cleanedResponse.trim()
+
+        analysisResult = JSON.parse(cleanedResponse)
+      } catch {
+        console.error('Failed to parse AI response:', responseContent)
+        analysisResult = localAnalyze(discussion)
       }
-      cleanedResponse = cleanedResponse.trim()
-      
-      analysisResult = JSON.parse(cleanedResponse)
-    } catch (parseError) {
-      console.error('Failed to parse AI response:', responseContent)
-      
-      // Fallback: Try to extract meaningful content even if JSON parsing fails
-      analysisResult = {
-        summary: 'Unable to generate a structured summary. Please try again with a clearer discussion format.',
-        decisions: [],
-        action_items: [],
-      }
+    } catch (aiError) {
+      // Local fallback keeps demo functional when .z-ai-config is unavailable.
+      console.error('AI SDK unavailable, using local analysis fallback:', aiError)
+      analysisResult = localAnalyze(discussion)
     }
 
     // Validate the structure
@@ -118,4 +123,68 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     )
   }
+}
+
+function localAnalyze(discussion: string) {
+  const lines = discussion
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  const speakerLines = lines.map((line) => {
+    const match = line.match(/^([A-Za-z][A-Za-z\s]{0,30}):\s*(.+)$/)
+    if (!match) return { speaker: 'Team', text: line }
+    return { speaker: match[1].trim(), text: match[2].trim() }
+  })
+
+  const summary = buildSummary(speakerLines.map((l) => l.text))
+  const decisions = extractDecisions(speakerLines)
+  const action_items = extractActionItems(speakerLines)
+
+  return {
+    summary,
+    decisions,
+    action_items,
+  }
+}
+
+function buildSummary(sentences: string[]) {
+  const cleaned = sentences.filter((s) => s.length > 0)
+  if (cleaned.length === 0) {
+    return 'No discussion content was provided.'
+  }
+
+  const first = cleaned[0]
+  const second = cleaned.find((s) => s !== first)
+
+  if (!second) {
+    return first
+  }
+
+  return `${first} ${second}`
+}
+
+function extractDecisions(lines: Array<{ speaker: string; text: string }>) {
+  const decisionPattern = /(decide|decided|finalize|finalized|agree|agreed|go with|chosen|selected|approved|commit to)/i
+  return lines
+    .filter(({ text }) => decisionPattern.test(text))
+    .map(({ text }) => text)
+    .slice(0, 8)
+}
+
+function extractActionItems(lines: Array<{ speaker: string; text: string }>) {
+  const actionPattern = /(i\s*'ll|i will|we should|let\s*'s|need to|will handle|take care of|complete|create|share|prepare|review|finish)/i
+  const deadlinePattern = /(today|tonight|tomorrow|day after tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|by\s+[^.,;]+)/i
+
+  return lines
+    .filter(({ text }) => actionPattern.test(text))
+    .map(({ speaker, text }) => {
+      const deadlineMatch = text.match(deadlinePattern)
+      return {
+        task: text,
+        assignee: speaker,
+        ...(deadlineMatch ? { deadline: deadlineMatch[0] } : {}),
+      }
+    })
+    .slice(0, 12)
 }
